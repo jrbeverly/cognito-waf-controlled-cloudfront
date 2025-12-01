@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda@Edge viewer-request auth gate for CloudFront
+
+Parameters:
+  UserPoolId:
+    Type: String
+
+  ClientId:
+    Type: String
+
+  ClientSecret:
+    Type: String
+    NoEcho: true
+
+  HostedUiDomain:
+    Type: String
+    Description: e.g. my-site-users-auth.auth.us-east-1.amazoncognito.com
+
+  CloudFrontDomain:
+    Type: String
+    Description: CloudFront distribution domain, e.g. d1234.cloudfront.net
+
+Resources:
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+          const https = require('https');
+          const CLIENT_ID = '${ClientId}';
+          const CLIENT_SECRET = '${ClientSecret}';
+          const HOSTED_UI = '${HostedUiDomain}';
+          const REDIRECT_URI = 'https://${CloudFrontDomain}/callback';
+          const LOGOUT_URI = 'https://${CloudFrontDomain}/';
+          const COGNITO_ISSUER = 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}';
+          function parseCookies(header) {
+            if (!header) return {};
+            return header.split(';').reduce((acc, part) => {
+              const eq = part.indexOf('=');
+              if (eq > 0) acc[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+              return acc;
+            }, {});
+          }
+          function decodePayload(token) {
+            try { return JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString()); }
+            catch { return null; }
+          }
+          function isValid(token) {
+            const p = decodePayload(token);
+            if (!p) return false;
+            if (p.exp && p.exp < Math.floor(Date.now() / 1000)) return false;
+            if (p.iss && p.iss !== COGNITO_ISSUER) return false;
+            return true;
+          }
+          function exchangeCode(code) {
+            const auth = Buffer.from(CLIENT_ID + ':' + CLIENT_SECRET).toString('base64');
+            const body = Buffer.from(
+              'grant_type=authorization_code' +
+              '&client_id=' + encodeURIComponent(CLIENT_ID) +
+              '&code=' + encodeURIComponent(code) +
+              '&redirect_uri=' + encodeURIComponent(REDIRECT_URI)
+            );
+            return new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: HOSTED_UI,
+                path: '/oauth2/token',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'Content-Length': body.length,
+                  'Authorization': 'Basic ' + auth,
+                },
+              }, res => {
+                let raw = '';
+                res.on('data', d => { raw += d; });
+                res.on('end', () => { try { resolve(JSON.parse(raw)); } catch { reject(new Error('parse')); } });
+              });
+              req.on('error', reject);
+              req.write(body);
+              req.end();
+            });
+          }
+          function setCookie(name, value, maxAge) {
+            return name + '=' + encodeURIComponent(value) + '; Path=/; Max-Age=' + maxAge + '; Secure; HttpOnly; SameSite=Lax';
+          }
+          function clearCookie(name) {
+            return name + '=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly';
+          }
+          exports.handler = async (event) => {
+            const request = event.Records[0].cf.request;
+            const uri = request.uri;
+            const cookieStr = (request.headers['cookie'] || []).map(h => h.value).join('; ');
+            const cookies = parseCookies(cookieStr);
+            if (uri === '/logout') {
+              const dest = 'https://' + HOSTED_UI + '/logout' +
+                '?client_id=' + CLIENT_ID +
+                '&logout_uri=' + encodeURIComponent(LOGOUT_URI);
+              return {
+                status: '302',
+                headers: {
+                  location: [{ key: 'Location', value: dest }],
+                  'set-cookie': [
+                    { key: 'Set-Cookie', value: clearCookie('id_token') },
+                    { key: 'Set-Cookie', value: clearCookie('access_token') },
+                  ],
+                },
+              };
+            }
+            if (uri.startsWith('/callback')) {
+              const params = {};
+              (request.querystring || '').split('&').forEach(pair => {
+                const i = pair.indexOf('=');
+                if (i > 0) params[pair.slice(0, i)] = decodeURIComponent(pair.slice(i + 1));
+              });
+              if (!params.code) return { status: '400', body: 'Missing code' };
+              try {
+                const tokens = await exchangeCode(params.code);
+                if (!tokens.id_token) return { status: '502', body: 'Token exchange failed' };
+                return {
+                  status: '302',
+                  headers: {
+                    location: [{ key: 'Location', value: '/' }],
+                    'set-cookie': [
+                      { key: 'Set-Cookie', value: setCookie('id_token', tokens.id_token, 3600) },
+                      { key: 'Set-Cookie', value: setCookie('access_token', tokens.access_token || '', 3600) },
+                    ],
+                  },
+                };
+              } catch {
+                return { status: '502', body: 'Token exchange error' };
+              }
+            }
+            if (cookies.id_token && isValid(cookies.id_token)) {
+              return request;
+            }
+            const authorizeUrl = 'https://' + HOSTED_UI + '/oauth2/authorize' +
+              '?client_id=' + CLIENT_ID +
+              '&response_type=code' +
+              '&scope=openid+email+profile' +
+              '&redirect_uri=' + encodeURIComponent(REDIRECT_URI);
+            return {
+              status: '302',
+              headers: {
+                location: [{ key: 'Location', value: authorizeUrl }],
+              },
+            };
+          };
+
+  AuthFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref AuthFunction
+      Description: viewer-request auth gate
+
+Outputs:
+  LambdaVersionArn:
+    Value: !Ref AuthFunctionVersion
+    Description: Pass this to the delivery stack as LambdaEdgeArn

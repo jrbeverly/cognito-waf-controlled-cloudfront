@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Scheduled Cognito user cleanup via SSM Automation
+
+Parameters:
+  UserPoolId:
+    Type: String
+
+Resources:
+
+  CleanupDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: '0.3'
+        description: Delete Cognito users whose last_login is older than 30 days
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          UserPoolId:
+            type: String
+          AutomationAssumeRole:
+            type: String
+        mainSteps:
+          - name: DeleteStaleUsers
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: handler
+              InputPayload:
+                userPoolId: '{{ UserPoolId }}'
+              Script: |-
+                import boto3, time
+                def handler(events, context):
+                    client = boto3.client('cognito-idp')
+                    threshold = int(time.time()) - 30 * 86400
+                    paginator = client.get_paginator('list_users')
+                    for page in paginator.paginate(UserPoolId=events['userPoolId']):
+                        for user in page['Users']:
+                            for attr in user.get('Attributes', []):
+                                if attr['Name'] == 'custom:last_login':
+                                    if int(attr['Value']) < threshold:
+                                        client.admin_delete_user(UserPoolId=events['userPoolId'], Username=user['Username'])
+                                    break
+
+  CleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+      Policies:
+        - PolicyName: CognitoCleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:ListUsers
+                  - cognito-idp:AdminDeleteUser
+                Resource: '*'
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartAutomation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:StartAutomationExecution
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${CleanupDocument}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CleanupRole.Arn
+
+  CleanupSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Id: cognito-cleanup
+          Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${CleanupDocument}'
+          RoleArn: !GetAtt EventsRole.Arn
+          Input: !Sub '{"UserPoolId":["${UserPoolId}"],"AutomationAssumeRole":["${CleanupRole.Arn}"]}'

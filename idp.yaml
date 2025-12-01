@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Second Cognito user pool standing in for the external OIDC provider
+
+Resources:
+
+  IdpPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+
+  IdpDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: cwcf-idp
+      UserPoolId: !Ref IdpPool
+
+  IdpClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref IdpPool
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - https://cwcf-users-auth.auth.us-east-1.amazoncognito.com/oauth2/idpresponse
+
+  IdpUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref IdpPool
+      Username: alice
+      MessageAction: SUPPRESS
+      UserAttributes:
+        - Name: email
+          Value: alice@example.com
+        - Name: email_verified
+          Value: 'true'
+
+Outputs:
+  IdpPoolId:
+    Value: !Ref IdpPool
+  IdpClientId:
+    Value: !Ref IdpClient

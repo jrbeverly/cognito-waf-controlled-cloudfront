@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cognito user pool with external OIDC federation and pre-token-generation login tracking
+
+Parameters:
+  CloudFrontDomain:
+    Type: String
+
+  OidcIssuerUrl:
+    Type: String
+
+  OidcClientId:
+    Type: String
+
+  OidcClientSecret:
+    Type: String
+    NoEcho: true
+
+Resources:
+
+  StampLoginRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StampLastLogin
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:AdminUpdateUserAttributes
+                Resource: '*'
+
+  StampLoginFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt StampLoginRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import boto3, time
+          def handler(event, context):
+              boto3.client('cognito-idp').admin_update_user_attributes(
+                  UserPoolId=event['userPoolId'],
+                  Username=event['userName'],
+                  UserAttributes=[{'Name': 'custom:last_login', 'Value': str(int(time.time()))}]
+              )
+              return event
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Schema:
+        - Name: last_login
+          AttributeDataType: Number
+          Mutable: true
+      LambdaConfig:
+        PreTokenGeneration: !GetAtt StampLoginFunction.Arn
+
+  StampLoginPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt StampLoginFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  OidcProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: ExternalOidc
+      ProviderType: OIDC
+      ProviderDetails:
+        client_id: !Ref OidcClientId
+        client_secret: !Ref OidcClientSecret
+        oidc_issuer: !Ref OidcIssuerUrl
+        authorize_scopes: 'openid email profile'
+        attributes_request_method: GET
+      AttributeMapping:
+        email: email
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${AWS::StackName}-auth'
+      UserPoolId: !Ref UserPool
+
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: OidcProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      SupportedIdentityProviders:
+        - ExternalOidc
+      CallbackURLs:
+        - !Sub 'https://${CloudFrontDomain}/callback'
+      LogoutURLs:
+        - !Sub 'https://${CloudFrontDomain}/'
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  AppClientId:
+    Value: !Ref AppClient
+  HostedUiDomain:
+    Value: !Sub '${AWS::StackName}-auth.auth.${AWS::Region}.amazoncognito.com'
